@@ -9,7 +9,7 @@ POST /v1/htr  {"image": "<data URL | base64 | http(s) URL>",
 Координаты box — в пикселях изображения после crop/rotate.
 GET /health
 """
-import base64, io, os, tempfile, time
+import base64, io, os, time
 
 import httpx
 import numpy as np
@@ -19,15 +19,21 @@ from PIL import Image, ImageOps
 from pydantic import BaseModel
 from transformers import TrOCRProcessor, VisionEncoderDecoderModel
 
+import nafrec.seg_inference as seg
 from nafrec.image_processing import crop_lines
 from nafrec.seg_inference import load_rfdetr_model, predict_polygons
 from nafrec.utils import get_default_region, get_line_regions, order_regions_lines
+
+# predict_polygons принимает только путь и читает файл через load_with_torchvision в массив (H, W, RGB).
+# Готовый массив пропускаем насквозь — так страницу не нужно сжимать в PNG и читать обратно (~1–3,5 с CPU).
+_load_file = seg.load_with_torchvision
+seg.load_with_torchvision = lambda src: src if isinstance(src, np.ndarray) else _load_file(src)
 
 HTR_DIR = os.environ["HTR_MODEL_DIR"]
 DET_PATH = os.environ["HTR_DET_MODEL"]
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 DTYPE = torch.float16 if DEVICE == "cuda" else torch.float32
-BATCH = int(os.environ.get("HTR_BATCH", "4"))
+BATCH = int(os.environ.get("HTR_BATCH", "8"))
 
 proc = TrOCRProcessor.from_pretrained(HTR_DIR, subfolder="processor")
 model = VisionEncoderDecoderModel.from_pretrained(HTR_DIR, torch_dtype=DTYPE).to(DEVICE).eval()
@@ -56,9 +62,7 @@ def load(src: str) -> Image.Image:
 
 def detect(im: Image.Image):
     """Полигоны строк в порядке чтения: [(region, polygon, conf)]. Логика упорядочивания — как в nafrec.predict_single_image."""
-    with tempfile.NamedTemporaryFile(suffix=".png") as f:
-        im.save(f.name)
-        lines, confs, mms, regs, reg_confs, reg_mms, shape = predict_polygons(det, f.name)
+    lines, confs, mms, regs, reg_confs, reg_mms, shape = predict_polygons(det, np.asarray(im))
     if not lines:
         return []
     regions = [{"coords": p, "id": str(i), "max_min": mm, "name": "paragraph", "img_shape": shape, "conf": c}
@@ -73,12 +77,18 @@ def detect(im: Image.Image):
 @torch.inference_mode()
 def recognize(crops: list[Image.Image], n_best: int, num_beams: int) -> list[list[str]]:
     n_best = max(1, min(n_best, num_beams))
-    res = []
-    for i in range(0, len(crops), BATCH):
-        pv = proc(crops[i:i + BATCH], return_tensors="pt").pixel_values.to(DEVICE, DTYPE)
-        seq = model.generate(pv, num_beams=num_beams, num_return_sequences=n_best, max_new_tokens=96)
+    # Пачка ждёт самую длинную строку, поэтому строки идут в пачки по ширине (≈ длине текста), а ответ — в исходном порядке.
+    order = sorted(range(len(crops)), key=lambda k: crops[k].width)
+    res = [None] * len(crops)
+    for i in range(0, len(order), BATCH):
+        ids = order[i:i + BATCH]
+        pv = proc([crops[k] for k in ids], return_tensors="pt").pixel_values.to(DEVICE, DTYPE)
+        # max_length, а не max_new_tokens: в конфиге модели свой max_length=128, и вместе они дают предупреждение на каждый вызов.
+        # 97 = стартовый токен декодера + 96 новых.
+        seq = model.generate(pv, num_beams=num_beams, num_return_sequences=n_best, max_length=97)
         txt = proc.batch_decode(seq, skip_special_tokens=True)
-        res += [txt[j:j + n_best] for j in range(0, len(txt), n_best)]
+        for k, j in zip(ids, range(0, len(txt), n_best)):
+            res[k] = txt[j:j + n_best]
     return res
 
 
